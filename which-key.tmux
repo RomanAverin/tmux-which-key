@@ -16,6 +16,10 @@ get_tmux_option() {
     fi
 }
 
+shell_quote() {
+    printf "%q" "$1"
+}
+
 main() {
     local trigger
     trigger=$(get_tmux_option "@which-key-trigger" "Space")
@@ -44,15 +48,20 @@ main() {
     # Build config flag
     local config_flag=""
     if [[ -n "$config" ]]; then
-        config_flag="--config $config"
+        config_flag="--config $(shell_quote "$config")"
     fi
 
     # Build popup command
+    local popup_shell_command
+    local script
+    script=$(shell_quote "$CURRENT_DIR/scripts/which-key.sh")
+    popup_shell_command="$script $config_flag --client \"#{client_tty}\" \"#{pane_id}\""
+
     local popup_cmd="tmux display-popup -E"
-    popup_cmd+=" -h $popup_height -w $popup_width"
-    popup_cmd+=" -x $popup_x -y $popup_y"
-    popup_cmd+=" -S 'fg=$popup_fg' -s 'bg=$popup_bg'"
-    popup_cmd+=" '$CURRENT_DIR/scripts/which-key.sh $config_flag #{pane_id}'"
+    popup_cmd+=" -h $(shell_quote "$popup_height") -w $(shell_quote "$popup_width")"
+    popup_cmd+=" -x $(shell_quote "$popup_x") -y $(shell_quote "$popup_y")"
+    popup_cmd+=" -S $(shell_quote "fg=$popup_fg") -s $(shell_quote "bg=$popup_bg")"
+    popup_cmd+=" $(shell_quote "$popup_shell_command")"
 
     tmux bind-key "$trigger" run-shell "$popup_cmd"
 }

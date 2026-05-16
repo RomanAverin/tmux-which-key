@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 # tmux-which-key - LazyVim-style which-key popup for tmux
-# Usage: which-key.sh [--config <path>] <pane_id>
+# Usage: which-key.sh [--config <path>] [--client <target-client>] <pane_id>
 
 set -uo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_FILE=""
 PANE_ID=""
+CLIENT_ID=""
+SESSION_ID=""
+WINDOW_ID=""
+VERSION_INFO=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --config)
             CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --client)
+            CLIENT_ID="$2"
             shift 2
             ;;
         *)
@@ -44,7 +52,7 @@ C_HDR=$'\033[38;2;129;161;193m'       # #81A1C1 - blue
 C_R=$'\033[0m'
 
 if [[ -z "$PANE_ID" ]]; then
-    echo "Usage: which-key.sh [--config <path>] <pane_id>"
+    echo "Usage: which-key.sh [--config <path>] [--client <target-client>] <pane_id>"
     exit 1
 fi
 
@@ -56,8 +64,143 @@ fi
 # Read entire config into memory once
 CONFIG=$(cat "$CONFIG_FILE")
 
+# Resolve the originating tmux context once. Commands may run after this popup
+# exits, so implicit tmux targets are not reliable.
+SESSION_ID=$(tmux display-message -t "$PANE_ID" -p '#{session_id}')
+WINDOW_ID=$(tmux display-message -t "$PANE_ID" -p '#{window_id}')
+if [[ -z "$CLIENT_ID" ]]; then
+    CLIENT_ID=$(tmux display-message -p '#{client_tty}' 2>/dev/null || true)
+fi
+
+get_version_info() {
+    local tag commit
+
+    tag=$(git -C "$PLUGIN_DIR" describe --tags --abbrev=0 2>/dev/null || true)
+    commit=$(git -C "$PLUGIN_DIR" rev-parse --short HEAD 2>/dev/null || true)
+
+    [[ -n "$tag" ]] || tag="none"
+    [[ -n "$commit" ]] || commit="unknown"
+
+    printf "tag %s | commit %s" "$tag" "$commit"
+}
+
+VERSION_INFO=$(get_version_info)
+
 # Navigation stack (jq path indices)
 NAV_STACK=()
+
+shell_quote() {
+    printf "%q" "$1"
+}
+
+expand_tmux_formats() {
+    local command="$1"
+    local token="__TMUX_WHICH_KEY_PERCENT_PLACEHOLDER__"
+    command="${command//%%/$token}"
+    command=$(tmux display-message -t "$PANE_ID" -p "$command")
+    command="${command//$token/%%}"
+    printf "%s" "$command"
+}
+
+with_tmux_target() {
+    local command="$1"
+    local flag="$2"
+    local target="$3"
+    local name rest
+
+    if [[ -z "$target" ]]; then
+        printf "%s" "$command"
+        return
+    fi
+
+    name="${command%%[[:space:]]*}"
+    if [[ "$name" == "$command" ]]; then
+        rest=""
+    else
+        rest="${command#"$name"}"
+    fi
+
+    printf "%s %s %s%s" "$name" "$flag" "$(shell_quote "$target")" "$rest"
+}
+
+exec_tmux() {
+    local command="$1"
+    eval "tmux $command"
+}
+
+run_tmux_command() {
+    local command="$1"
+    local expanded name targeted
+
+    expanded=$(expand_tmux_formats "$command")
+    name="${expanded%%[[:space:]]*}"
+
+    case "$name" in
+        command-prompt|confirm-before)
+            targeted=$(with_tmux_target "$expanded" "-t" "$CLIENT_ID")
+            tmux run-shell -b "sleep 0.1 && tmux $targeted"
+            ;;
+        display-panes)
+            targeted=$(with_tmux_target "$expanded" "-t" "$CLIENT_ID")
+            tmux run-shell -b "sleep 0.1 && tmux $targeted"
+            ;;
+        choose-tree|choose-buffer|choose-client|customize-mode|copy-mode)
+            targeted=$(with_tmux_target "$expanded" "-t" "$PANE_ID")
+            tmux run-shell -b "sleep 0.1 && tmux $targeted"
+            ;;
+        split-window|select-pane|resize-pane|kill-pane|join-pane|selectp|resizep|killp|joinp|swap-pane|swapp|clear-history|clearhist|capture-pane|capturep|respawn-pane|respawnp|paste-buffer|pasteb|clock-mode|clock)
+            targeted=$(with_tmux_target "$expanded" "-t" "$PANE_ID")
+            exec_tmux "$targeted"
+            ;;
+        break-pane|breakp)
+            targeted=$(with_tmux_target "$expanded" "-s" "$PANE_ID")
+            exec_tmux "$targeted"
+            ;;
+        new-window|neww|kill-window|killw|rename-window|renamew|move-window|movew|swap-window|swapw|rotate-window|rotatew|next-layout|nextl|previous-layout|prevl|select-layout|selectl|last-pane|lastp)
+            targeted=$(with_tmux_target "$expanded" "-t" "$WINDOW_ID")
+            exec_tmux "$targeted"
+            ;;
+        last-window|last|next-window|next|previous-window|prev)
+            targeted=$(with_tmux_target "$expanded" "-t" "$SESSION_ID")
+            exec_tmux "$targeted"
+            ;;
+        show-options|show)
+            if [[ "$expanded" == *" -g"* ]]; then
+                exec_tmux "$expanded"
+            else
+                targeted=$(with_tmux_target "$expanded" "-t" "$PANE_ID")
+                exec_tmux "$targeted"
+            fi
+            ;;
+        show-window-options|showw)
+            if [[ "$expanded" == *" -g"* ]]; then
+                exec_tmux "$expanded"
+            else
+                targeted=$(with_tmux_target "$expanded" "-t" "$WINDOW_ID")
+                exec_tmux "$targeted"
+            fi
+            ;;
+        rename-session|rename|kill-session|lock-session|lock-server)
+            targeted=$(with_tmux_target "$expanded" "-t" "$SESSION_ID")
+            exec_tmux "$targeted"
+            ;;
+        switch-client|switchc)
+            targeted=$(with_tmux_target "$expanded" "-c" "$CLIENT_ID")
+            exec_tmux "$targeted"
+            ;;
+        detach-client|detach|refresh-client|refresh|suspend-client|suspendc|lock-client|lockc)
+            targeted=$(with_tmux_target "$expanded" "-t" "$CLIENT_ID")
+            exec_tmux "$targeted"
+            ;;
+        load-buffer|loadb|show-messages|showmsgs)
+            targeted=$(with_tmux_target "$expanded" "-t" "$CLIENT_ID")
+            exec_tmux "$targeted"
+            ;;
+        *)
+            exec_tmux "$expanded"
+            ;;
+    esac
+}
 
 # Get current items as tab-separated lines: key\ttype\tdescription\tcommand\timmediate
 # Single jq call per menu level instead of per-item
@@ -87,7 +230,7 @@ render_menu() {
     breadcrumb=$(get_breadcrumb)
 
     # Header
-    printf "%s  Which Key%s  %s│%s  %s%s%s\n" "$C_HDR" "$C_R" "$C_SEP" "$C_R" "$C_DESC" "$breadcrumb" "$C_R"
+    printf "%s  Which Key%s  %s│%s  %s%s%s  %s│%s  %s%s%s\n" "$C_HDR" "$C_R" "$C_SEP" "$C_R" "$C_DESC" "$breadcrumb" "$C_R" "$C_SEP" "$C_R" "$C_SEP" "$VERSION_INFO" "$C_R"
     printf "%s" "$C_SEP"
     printf '%.0s─' {1..98}
     printf "%s\n" "$C_R"
@@ -163,19 +306,17 @@ handle_key() {
                     ;;
                 popup)
                     local pane_path
+                    local popup_target_args
                     pane_path=$(tmux display-message -t "$PANE_ID" -p '#{pane_current_path}')
-                    tmux run-shell -b "sleep 0.1 && tmux display-popup -E -h 80% -w 80% -d '$pane_path' '$command'"
+                    popup_target_args="-t $(shell_quote "$PANE_ID")"
+                    if [[ -n "$CLIENT_ID" ]]; then
+                        popup_target_args="-c $(shell_quote "$CLIENT_ID") $popup_target_args"
+                    fi
+                    tmux run-shell -b "sleep 0.1 && tmux display-popup -E -h 80% -w 80% $popup_target_args -d $(shell_quote "$pane_path") $(shell_quote "$command")"
                     exit 0
                     ;;
                 tmux)
-                    case "$command" in
-                        choose-*|command-prompt*|customize-mode*|copy-mode*)
-                            tmux run-shell -b "sleep 0.1 && tmux $command"
-                            ;;
-                        *)
-                            tmux $command
-                            ;;
-                    esac
+                    run_tmux_command "$command"
                     exit 0
                     ;;
                 script)
